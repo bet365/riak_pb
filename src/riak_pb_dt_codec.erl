@@ -48,19 +48,23 @@
 -type context() :: binary() | undefined.
 -type counter_value() :: integer().
 -type set_value() :: [ binary() ].
+-type hll_value() :: number().
 -type gset_value() :: [ binary() ].
 -type register_value() :: binary().
 -type flag_value() :: boolean().
 -type map_entry() :: {map_field(), embedded_value()}.
 -type map_field() :: {binary(), embedded_type()}.
 -type map_value() :: [ map_entry() ].
--type embedded_value() :: counter_value() | set_value() | register_value() | flag_value() | map_value().
--type toplevel_value() :: counter_value() | gset_value() | set_value() | map_value() | undefined.
+-type embedded_value() :: counter_value() | set_value() | register_value()
+                        | flag_value() | map_value().
+-type toplevel_value() :: counter_value() | gset_value() | set_value() | map_value()
+                          | hll_value() | undefined.
 -type fetch_response() :: {toplevel_type(), toplevel_value(), context()}.
 
 %% Type names as atoms
 -type embedded_type() :: counter | set | register | flag | map.
--type toplevel_type() :: counter | set | gset | map.
+-type toplevel_type() :: counter | set | gset | map | hll.
+-type all_type()      :: toplevel_type() | embedded_type().
 
 %% Operations
 -type counter_op() :: increment | decrement | {increment | decrement, integer()}.
@@ -68,12 +72,13 @@
 -type set_op() :: simple_set_op() | {update, [simple_set_op()]}.
 -type simple_gset_op() :: {add, binary()} | {add_all, [binary()]}.
 -type gset_op() :: simple_gset_op() | {update, [simple_gset_op()]}.
+-type hll_op() :: {add, binary()} | {add_all, [binary()]}.
 -type flag_op() :: enable | disable.
 -type register_op() :: {assign, binary()}.
 -type simple_map_op() :: {remove, map_field()} | {update, map_field(), embedded_type_op()}.
 -type map_op() :: simple_map_op() | {update, [simple_map_op()]}.
 -type embedded_type_op() :: counter_op() | set_op() | register_op() | flag_op() | map_op().
--type toplevel_op() :: counter_op() | gset_op() | set_op() | map_op().
+-type toplevel_op() :: counter_op() | gset_op() | set_op() | map_op() | hll_op().
 -type update() :: {toplevel_type(), toplevel_op(), context()}.
 
 %% Request options
@@ -92,7 +97,7 @@
                      include_context | {include_context, boolean()}.
 
 %% Server-side type<->module mappings
--type type_mappings() :: [{embedded_type(), module()}].
+-type type_mappings() :: [{all_type(), module()}].
 
 
 %% =========================
@@ -168,11 +173,12 @@ decode_type(PBType, Mods) ->
     AtomType = decode_type(PBType),
     proplists:get_value(AtomType, Mods, AtomType).
 
-%% @doc Decodes a PB message type name into an atom.
--spec decode_type(atom()) -> atom().
+%% @doc Decodes a PB message type name into an atom type name.
+-spec decode_type(atom()) -> all_type().
 decode_type('COUNTER')  -> counter;
 decode_type('SET')      -> set;
 decode_type('GSET')     -> gset;
+decode_type('HLL')      -> hll;
 decode_type('REGISTER') -> register;
 decode_type('FLAG')     -> flag;
 decode_type('MAP')      -> map.
@@ -189,10 +195,11 @@ encode_type(TypeOrMod, Mods) ->
     end.
 
 %% @doc Encodes an atom type name into the PB message equivalent.
--spec encode_type(atom()) -> atom().
+-spec encode_type(all_type()) -> atom().
 encode_type(counter)  -> 'COUNTER';
 encode_type(set)      -> 'SET';
 encode_type(gset)     -> 'GSET';
+encode_type(hll)      -> 'HLL';
 encode_type(register) -> 'REGISTER';
 encode_type(flag)     -> 'FLAG';
 encode_type(map)      -> 'MAP'.
@@ -201,6 +208,7 @@ encode_type(map)      -> 'MAP'.
 encode_flag_value(on) -> true;
 encode_flag_value(off) -> false;
 encode_flag_value(Other) -> Other.
+
 
 %% ========================
 %% FETCH REQUEST / RESPONSE
@@ -257,10 +265,12 @@ decode_fetch_response(#dtfetchresp{context=Context, type='COUNTER',
 decode_fetch_response(#dtfetchresp{context=Context, type='SET',
                                    value=#dtvalue{set_value=Val}}) ->
     {set, Val, Context};
-
 decode_fetch_response(#dtfetchresp{context=Context, type='GSET',
                                    value=#dtvalue{set_value=Val}}) ->
     {gset, Val, Context};
+decode_fetch_response(#dtfetchresp{context=Context, type='HLL',
+                                   value=#dtvalue{hll_value=Val}}) ->
+    {hll, Val, Context};
 decode_fetch_response(#dtfetchresp{context=Context, type='MAP',
                                    value=#dtvalue{map_value=Val}}) ->
     {map, [ decode_map_entry(Entry) || Entry <- Val ], Context}.
@@ -271,7 +281,8 @@ encode_fetch_response(Type, Value, Context) ->
     encode_fetch_response(Type, Value, Context, []).
 
 %% @doc Encodes the result of a fetch request into a FetchResponse message.
--spec encode_fetch_response(toplevel_type(), toplevel_value(), context(), type_mappings()) -> #dtfetchresp{}.
+-spec encode_fetch_response(toplevel_type(), toplevel_value(), context(),
+                            type_mappings()) -> #dtfetchresp{}.
 encode_fetch_response(Type, undefined, _Context, _Mods) ->
     #dtfetchresp{type=encode_type(Type)};
 encode_fetch_response(Type, Value, Context, Mods) ->
@@ -283,6 +294,8 @@ encode_fetch_response(Type, Value, Context, Mods) ->
             Response#dtfetchresp{value=#dtvalue{set_value=Value}};
         gset ->
             Response#dtfetchresp{value=#dtvalue{gset_value=Value}};
+        hll ->
+            Response#dtfetchresp{value=#dtvalue{hll_value=Value}};
         map ->
             Response#dtfetchresp{value=#dtvalue{map_value=[encode_map_entry(Entry, Mods) || Entry <- Value]}}
     end.
@@ -369,6 +382,18 @@ decode_flag_op('DISABLE') -> disable.
 encode_flag_op(enable)  -> 'ENABLE';
 encode_flag_op(disable) -> 'DISABLE'.
 
+%% @doc Decodes a HllOp message into a hll operation.
+-spec decode_hll_op(#hllop{}) -> hll_op().
+decode_hll_op(#hllop{adds=A}) ->
+    {add_all, A}.
+
+%% @doc Encodes an hll(set) update into the HllOp message.
+-spec encode_hll_op(hll_op()) -> #hllop{}.
+encode_hll_op({add, Member}) when is_binary(Member) ->
+    #hllop{adds=[Member]};
+encode_hll_op({add_all, Members}) when is_list(Members) ->
+    #hllop{adds=Members}.
+
 %% @doc Decodes a MapUpdate message into a map field operation.
 -spec decode_map_update(#mapupdate{}, type_mappings()) -> {map_field(), embedded_type_op()}.
 decode_map_update(#mapupdate{field=#mapfield{name=N, type='COUNTER'=Type}, counter_op=#counterop{}=Op}, Mods) ->
@@ -445,6 +470,8 @@ decode_operation(#dtop{set_op=#setop{}=Op}, _) ->
     decode_set_op(Op);
 decode_operation(#dtop{gset_op=#gsetop{}=Op}, _) ->
     decode_gset_op(Op);
+decode_operation(#dtop{hll_op=#hllop{}=Op}, _) ->
+    decode_hll_op(Op);
 decode_operation(#dtop{map_op=#mapop{}=Op}, Mods) ->
     decode_map_op(Op, Mods).
 
@@ -456,6 +483,8 @@ encode_operation(Op, set) ->
     #dtop{set_op=encode_set_op(Op)};
 encode_operation(Op, gset) ->
     #dtop{gset_op=encode_gset_op(Op)};
+encode_operation(Op, hll) ->
+    #dtop{hll_op=encode_hll_op(Op)};
 encode_operation(Op, map) ->
     #dtop{map_op=encode_map_op(Op)}.
 
@@ -468,6 +497,8 @@ operation_type(#dtop{set_op=#setop{}}) ->
     set;
 operation_type(#dtop{gset_op=#gsetop{}}) ->
     gset;
+operation_type(#dtop{hll_op=#hllop{}}) ->
+    hll;
 operation_type(#dtop{map_op=#mapop{}}) ->
     map.
 
@@ -525,6 +556,9 @@ decode_update_response(#dtupdateresp{key=K}, _, false) ->
     end;
 decode_update_response(#dtupdateresp{counter_value=C, context=Ctx}=Resp, counter, true) ->
     maybe_wrap_key({counter, C, Ctx}, Resp);
+decode_update_response(#dtupdateresp{hll_value=Hll, context=Ctx}=Resp, hll,
+                       true) ->
+    maybe_wrap_key({hll, Hll, Ctx}, Resp);
 decode_update_response(#dtupdateresp{set_value=S, context=Ctx}=Resp, set, true) ->
     maybe_wrap_key({set, S, Ctx}, Resp);
 decode_update_response(#dtupdateresp{map_value=M, context=Ctx}=Resp, map, true) ->
@@ -534,18 +568,21 @@ maybe_wrap_key(Term, #dtupdateresp{key=undefined}) -> Term;
 maybe_wrap_key(Term, #dtupdateresp{key=K}) -> {K, Term}.
 
 %% @doc Encodes an update response into a DtUpdateResp message.
--spec encode_update_response(toplevel_type(), toplevel_value(), binary(), context()) -> #dtupdateresp{}.
+-spec encode_update_response(toplevel_type(), toplevel_value(), binary(),
+                             context()) -> #dtupdateresp{}.
 encode_update_response(Type, Value, Key, Context) ->
     encode_update_response(Type, Value, Key, Context, []).
 
 %% @doc Encodes an update response into a DtUpdateResp message.
--spec encode_update_response(toplevel_type(), toplevel_value(), binary(), context(), type_mappings()) -> #dtupdateresp{}.
+-spec encode_update_response(toplevel_type(), toplevel_value(), binary(),
+                             context(), type_mappings()) -> #dtupdateresp{}.
 encode_update_response(counter, Value, Key, Context, _Mods) ->
     #dtupdateresp{key=Key, context=Context, counter_value=Value};
 encode_update_response(set, Value, Key, Context, _Mods) ->
     #dtupdateresp{key=Key, context=Context, set_value=Value};
+encode_update_response(hll, Value, Key, Context, _Mods) ->
+    #dtupdateresp{key=Key, context=Context, hll_value=Value};
 encode_update_response(map, Value, Key, Context, Mods) when is_list(Value) ->
     #dtupdateresp{key=Key, context=Context,
-                  map_value=[ encode_map_entry(Entry, Mods) || Value /= undefined,
-                                                               Entry <- Value ]}.
-
+                  map_value=[encode_map_entry(Entry, Mods)
+                             || Value /= undefined,  Entry <- Value]}.
